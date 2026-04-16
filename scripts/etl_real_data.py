@@ -33,13 +33,16 @@ SOURCES = {
     "colunga_junaeb": f"{CDN_COLUNGA}/colunga/viz-colunga/vulnerabilidad-multidimensional/datos/data_mapa_junaeb_v2.json",
     "colunga_matricula": f"{CDN_COLUNGA}/colunga/viz-colunga/matricula-basica/datos/matriculas-basica.json",
     "colunga_indice": f"{CDN_COLUNGA}/colunga/data/data-indice-bienestar/data_mapa_indice_v2.json",
+    "sip_colegios": "gh://Unholster/sip-mapa-colegios/bea54072b62a2ab22579eb6435270896cb4d9aa7",
     "sofofa_seia": f"{CDN_SOFOFA}/latest/mapa_data.min.json.gz",
     "achs_hospitales": f"{CDN_ACHS}/latest/datos_hospitales_snss.min.json.gz",
 }
 
 
 def fetch_json(url):
-    """Fetch JSON, handling gzip if needed."""
+    """Fetch JSON, handling gzip and GitHub blob URLs."""
+    if url.startswith("gh://"):
+        return fetch_github_blob(url)
     print(f"  Fetching {url.split('/')[-1]}...")
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -51,6 +54,22 @@ def fetch_json(url):
             except gzip.BadGzipFile:
                 pass  # Not actually gzipped
         return json.loads(data.decode("utf-8"))
+
+
+def fetch_github_blob(url):
+    """Fetch a large file from GitHub via git blob API. Format: gh://owner/repo/sha"""
+    import subprocess
+    parts = url.replace("gh://", "").split("/")
+    owner, repo, sha = parts[0], parts[1], parts[2]
+    print(f"  Fetching from GitHub: {owner}/{repo} (blob {sha[:12]}...)...")
+    result = subprocess.run(
+        ["gh", "api", f"repos/{owner}/{repo}/git/blobs/{sha}",
+         "-H", "Accept: application/vnd.github.raw"],
+        capture_output=True, timeout=60
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"gh api failed: {result.stderr.decode()}")
+    return json.loads(result.stdout.decode("utf-8"))
 
 
 def load_topo_comunas():
@@ -160,6 +179,79 @@ def process_colunga_matricula(data, comunas):
         if not ck or not year:
             continue
         add_time_series(comunas, ck, "educacion.matricula_basica", year, row.get("value_com"))
+
+
+def process_sip_colegios(data, comunas, topo_mapping):
+    """Process SIP colegios data — aggregate PAES scores and matrícula by comuna."""
+    features = data.get("features", [])
+    print(f"  Processing {len(features)} school features...")
+
+    # Build a reverse lookup: comuna name -> canonical_key
+    name_to_key = {}
+    for ck, info in topo_mapping.items():
+        name_norm = info["comuna"].lower().strip()
+        name_to_key[name_norm] = ck
+
+    # Aggregate by comuna
+    comuna_schools = defaultdict(lambda: {"count": 0, "paes_sum": 0, "paes_n": 0, "mat_total": 0})
+
+    for feat in features:
+        props = feat.get("properties", {})
+        comuna_name = (props.get("nom_com_rbd") or "").strip()
+        if not comuna_name:
+            continue
+
+        ck = name_to_key.get(comuna_name.lower())
+        if not ck:
+            continue
+
+        agg = comuna_schools[ck]
+        agg["count"] += 1
+
+        # PAES scores
+        for score_field in ["paes_24_I", "paes_24_II"]:
+            val = props.get(score_field)
+            if val is not None:
+                try:
+                    agg["paes_sum"] += float(val)
+                    agg["paes_n"] += 1
+                except (ValueError, TypeError):
+                    pass
+
+        # Matrícula
+        mat = props.get("mat_total")
+        if mat is not None:
+            try:
+                agg["mat_total"] += int(mat)
+            except (ValueError, TypeError):
+                pass
+
+    # Write aggregated data per comuna
+    for ck, agg in comuna_schools.items():
+        add_time_series(comunas, ck, "educacion.cantidad_colegios", 2024, agg["count"])
+        add_time_series(comunas, ck, "educacion.matricula_total", 2024, agg["mat_total"])
+        if agg["paes_n"] > 0:
+            avg_paes = round(agg["paes_sum"] / agg["paes_n"], 1)
+            add_time_series(comunas, ck, "educacion.promedio_paes", 2024, avg_paes)
+
+    # Also add per-school PAES for time series from older tests
+    for feat in features:
+        props = feat.get("properties", {})
+        comuna_name = (props.get("nom_com_rbd") or "").strip()
+        ck = name_to_key.get(comuna_name.lower())
+        if not ck:
+            continue
+        for field, year in [("psu", 2019), ("pdt_21_22", 2022), ("paes_23", 2023)]:
+            val = props.get(field)
+            if val is not None:
+                try:
+                    add_time_series(comunas, ck, "educacion.promedio_paes", year, float(val))
+                except (ValueError, TypeError):
+                    pass
+
+    # Save as GeoJSON points for the map layer
+    save_points_geojson(features, "educacion")
+    return len(features)
 
 
 def process_sofofa(data, comunas):
@@ -345,6 +437,8 @@ def main():
                 process_colunga_indice(data, comunas_raw)
             elif source_name == "colunga_matricula":
                 process_colunga_matricula(data, comunas_raw)
+            elif source_name == "sip_colegios":
+                process_sip_colegios(data, comunas_raw, topo_mapping)
             elif source_name == "sofofa_seia":
                 process_sofofa(data, comunas_raw)
             elif source_name == "achs_hospitales":
